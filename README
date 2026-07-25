@@ -1,0 +1,185 @@
+# Canals — Order Management API
+
+Beackend service for e-commerce platform. Web server with minimal order management API.
+With Warehouse automatic selection, mock APIs for payment and geolocation.
+
+## Stack
+
+- TypeScript + Fastify
+- PostgreSQL via `pg`
+- Docker (only for database)
+- Zod (request validation)
+- node-pg-migrate (migrations)
+
+## How to setup
+
+Execute steps in order>:
+
+0. Open docker in desktop
+1. `docker compose up -d`
+2. `npm install`
+3. A .env file is included in this repo for reviewer convenience, in a real production setup, secrets would never be committed.
+4. `npm run migrate:up`
+5. `npm run seed`
+6. `npm run dev`
+7. Confirm correct execution in `http://localhost:3000`
+
+   ## Endpoint
+
+   `POST /orders` creates an order. See "Example scenarios" below for
+   request/response examples covering both success and error paths.
+
+## Design decisions and assumptions
+
+**Reserve before charging.** Stock is checked and reserved _before_ the payment
+API is called, not after. This guarantees a customer's card is never charged
+for an order that can't actually be fulfilled, if reservation fails, payment
+is never attempted.
+
+**Two separate transactions, not one.** Stock reservation + order creation run
+in one DB transaction. Payment is called _outside_ any transaction, since it's
+a network call to an external service and a transaction should never be held
+open across I/O like that. The payment result is then persisted in a second,
+separate transaction, which also handles compensation if the payment was declined.
+
+**Batched queries over per-item loops.** Warehouse eligibility, stock
+reservation, and order item inserts all use a single SQL statement per
+operation (via `VALUES` lists and `unnest()`) instead of looping one query per
+item. This avoids N+1 query patterns and keeps each business operation atomic
+at the database level.
+
+**Concurrency safety via atomic conditional updates.** Stock decrements use
+`UPDATE ... WHERE quantity >= requested_amount` as a single atomic statement,
+rather than a separate read-then-write. This means two concurrent requests
+competing for the same stock can't oversell it, Postgres's row-level locking
+(MVCC) serializes the competing updates automatically, with no explicit
+application-level locking required.
+
+**Raw SQL over an ORM.** Chosen deliberately to keep transaction boundaries,
+locking behavior, and query performance fully explicit and reviewable, rather
+than abstracted behind ORM-generated queries, especially important given how
+central transactional correctness is to this problem.
+
+## Data Model
+
+7 tables, designed around two distinct many-to-many relationships that are
+easy to conflate but serve different purposes:
+
+- **customers**, **items**, \*_warehouses_: base entities
+- **warehouse_items**: stock per warehouse (warehouse - item, with `quantity`)
+- **orders**: references customer + the warehouse that fulfills it,
+  geocoded shipping coordinates and `status` (pending/paid/failed)
+- **order_items** : what was ordered (order - item, with `quantity` and a
+  price snapshot at time of purchase, independent of the item's current
+  catalog price)
+- **payments**: one row per payment _attempt_ (an order can have multiple,
+  though the current flow only ever creates one); immutable once created
+
+## Error Handling
+
+All domain errors are mapped centrally (src/errors/error-mapping.ts) to a
+consistent JSON shape: { "error": "<ErrorName>", "message": "<detail>" }.
+Individual routes don't handle errors inline, everything funnels through
+Fastify's global error handler.
+
+- **400 Bad Request**
+  - Invalid request body (Zod validation failure — missing fields, wrong types, etc.)
+  - InvalidOrderInputError: order fails a business-rule check not covered by schema validation (e.g. an item ID that doesn't exist)
+  - InvalidAmountError / InvalidCardError: malformed payment input (amount ≤ 0, card number not 16 digits), rejected before any charge is attempted
+
+- **422 Unprocessable Entity**
+  - MissingFieldsError / InvalidAddressError: shipping address can't be resolved to coordinates
+  - GeocodingTimeoutError: simulated timeout from the geocoding provider
+
+- **409 Conflict**
+  - NoWarehouseAvailableError: no warehouse has sufficient stock of every requested item
+  - InsufficientStockError: stock changed between eligibility check and reservation (race condition)
+
+- **402 Payment Required**
+  - PaymentFailedError: payment gateway declined the card
+
+- **500 Internal Server Error**
+  - Any unhandled/unexpected error (bug, DB failure, or anything not explicitly anticipated)
+
+## Seed Data
+
+Since there's no API to manage customers/products/warehouses, run `npm run seed` after migrations to populate the
+database with a small, deliberately-designed dataset for manual testing:
+
+- **2 customers** (Juan Perez, Maria Rodriguez)
+- **4 items**: Laptop, Mouse, Keyboard, Monitor
+- **3 warehouses**, each with real city coordinates:
+  - **Bodega Bogota** full stock of all 4 items
+  - **Bodega Medellin** full stock of all 4 items (farther from a
+    Bogota shipping address)
+  - **Bodega Cali** missing stock of Monitor (0 units)/.
+
+The seed script prints all generated IDs to the console — copy them from
+there to build test request bodies, since IDs are UUIDs and can't be
+guessed.
+
+### Example scenarios
+
+**Happy path** — order fulfilled and paid successfully:
+
+```json
+{
+  "customerId": "6859846f-4e7e-4511-9bcf-e4d291e8d3a6",
+  "shippingAddress": {
+    "address": "Calle 100 #15-20",
+    "city": "Bogota",
+    "country": "Colombia"
+  },
+  "items": [
+    { "itemId": "d6ef5645-d3e7-493e-a83c-cf4fd9f041bb", "quantity": 1 },
+    { "itemId": "6a38e795-51b2-49dd-b1c3-7d68affeb666", "quantity": 2 }
+  ],
+  "cardNumber": "4111111111111111"
+}
+```
+
+Expected: `201`, order returned with `status: "paid"`, warehouse chosen is
+Bodega Bogota.
+
+**Payment declined** same body, but with the deterministic decline trigger:
+
+```json
+"cardNumber": "0000000000000000"
+```
+
+Expected: `402 PaymentFailedError`. Reserved stock is released back
+(compensating transaction), verifiable by checking `warehouse_items` before
+and after.
+
+**No eligible warehouse** request more stock than any warehouse has:
+
+```json
+{
+  "shippingAddress": {
+    "address": "Calle 100 #15-20",
+    "city": "Bogota",
+    "country": "Colombia"
+  },
+  "items": [
+    { "itemId": "b8e326cb-6eba-4fe6-8fd9-9a8ea219c7e5", "quantity": 999 }
+  ]
+}
+```
+
+Expected: `409 NoWarehouseAvailableError`.
+
+**Geocoding timeout** deterministic trigger via a special address value:
+
+```json
+"shippingAddress": { "address": "timeout", "city": "Bogota", "country": "Colombia" }
+```
+
+Expected: `422 GeocodingTimeoutError`.
+
+**Unrecognized address** a city not in the mock's lookup table:
+
+```json
+"shippingAddress": { "address": "Calle 1", "city": "Barranquilla", "country": "Colombia" }
+```
+
+Expected: `422 InvalidAddressError`.

@@ -53,8 +53,6 @@ export const up = (pgm) => {
     UNIQUE (warehouse_id, item_id)
     );
 
-    CREATE INDEX idx_warehouse_items_item_id ON warehouse_items(item_id);
-
     CREATE TABLE payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     order_id UUID NOT NULL REFERENCES orders(id),
